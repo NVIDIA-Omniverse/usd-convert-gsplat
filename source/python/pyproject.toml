@@ -1,6 +1,6 @@
 [project]
 name = "usd-convert-gsplat"
-version = "0.1.13"
+version = "0.1.14"
 description = "NVIDIA 3D Gaussian Splat to USD Converter"
 authors = [
     {name = "NVIDIA"},

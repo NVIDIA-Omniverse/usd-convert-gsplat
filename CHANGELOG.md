@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.14] - 2026-05-21
+### Changed
+- Update agent skill metadata and structure for Skills as Docs compliance
+
 ## [0.1.13] - 2026-05-21
 ### Changed
 - Release Prep
