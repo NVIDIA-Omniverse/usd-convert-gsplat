@@ -15,6 +15,11 @@ For USD support (if not already installed):
 pip install usd-convert-gsplat[usd]
 ```
 
+The `usd-convert-gsplat` installs `usd-core>=26.3` on x86_64 platforms and `usd-exchange==2.3.0` on linux-aarch64 (where `usd-core` wheels are unavailable). On aarch64 the 
+converter authors `ParticleField3DGaussianSplat` prims with custom attributes
+rather than the OpenUSD 26.03 typed schema API; output remains compatible with
+Omniverse viewers, but schema validation is not performed at write time.
+
 ## Building From Source
 
 The converter package lives in `source/python` and builds with standard Python

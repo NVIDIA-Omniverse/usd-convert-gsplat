@@ -10,7 +10,8 @@ files that use the `ParticleField3DGaussianSplat` schema.
   or `.usdz`.
 - Preserves positions, scales, orientations, opacities, and spherical harmonics
   data.
-- Uses `UsdVol.ParticleField3DGaussianSplat`, introduced in OpenUSD 26.03.
+- Uses `UsdVol.ParticleField3DGaussianSplat` when OpenUSD 26.03+ is available;
+  otherwise authors the prim type and attributes manually (see Requirements).
 - Provides a command-line interface through `usd-convert-gsplat` and
   `python -m usd_convert_gsplat`.
 - Exposes Python APIs for reading splat data and writing USD stages.
@@ -19,9 +20,20 @@ files that use the `ParticleField3DGaussianSplat` schema.
 
 - Python 3.11 or 3.12.
 - `numpy`, installed automatically with the package.
-- OpenUSD 26.03 or newer Python bindings when writing USD outside an Omniverse
-  environment. Install the package with the `usd` extra to pull in
-  `usd-core>=26.3`.
+- OpenUSD Python bindings when writing USD outside an Omniverse environment.
+  Install the package with the `usd` extra; the dependency is selected by
+  platform:
+
+  | Platform | Package | Notes |
+  | --- | --- | --- |
+  | x86_64 (and most non-aarch64) | `usd-core>=26.3` | Typed `UsdVol.ParticleField3DGaussianSplat` API (OpenUSD 26.03+) |
+  | linux-aarch64 | `usd-exchange==2.3.0` | Bundles OpenUSD ~25.x with `pxr` bindings |
+
+  On platforms without the registered `ParticleField3DGaussianSplat` schema
+  (including linux-aarch64 with `usd-exchange`), the converter writes a prim
+  with type `ParticleField3DGaussianSplat` and the expected attributes via
+  custom authoring. Output files remain compatible with Omniverse viewers, but
+  USD schema validation against the typed API is not performed at write time.
 
 ## Installation
 

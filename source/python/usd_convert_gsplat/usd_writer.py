@@ -4,10 +4,14 @@
 """
 USD writer for 3D Gaussian Splat data.
 
-Produces standard USD files using ParticleField3DGaussianSplat schema.
-Uses UsdVol.ParticleField3DGaussianSplat when available (OpenUSD 26.03+), or
-the Omniverse usd_particle_field schema (omni.usd.schema.usd_particle_field)
-when backported to older USD builds.
+Produces standard USD files using the ParticleField3DGaussianSplat schema.
+
+When OpenUSD 26.03+ is available (typically via usd-core on x86_64), the typed
+UsdVol.ParticleField3DGaussianSplat API is used. Otherwise the converter defines
+a prim with type ParticleField3DGaussianSplat and authors the expected attributes
+directly (used on linux-aarch64 with usd-exchange, or when the Omniverse
+usd_particle_field plugin is loaded). Schema validation against the typed API is
+not performed on the fallback path.
 """
 
 import math
@@ -35,6 +39,12 @@ except Exception:
 _EXTENT_LIMIT = 50000.0
 
 _PARTICLE_FIELD_3D_GAUSSIAN_SPLAT = "ParticleField3DGaussianSplat"
+
+_PRIM_CREATE_FAILURE_MSG = (
+    f"Failed to create {_PARTICLE_FIELD_3D_GAUSSIAN_SPLAT} prim. "
+    'Install USD support with pip install "usd-convert-gsplat[usd]" '
+    "(usd-core>=26.3 on x86_64; usd-exchange on linux-aarch64)."
+)
 
 UP_AXIS_Y = "Y"
 UP_AXIS_Z = "Z"
@@ -234,11 +244,8 @@ def _gaussian_splat_data_to_usd(
         gs_prim = UsdVol.ParticleField3DGaussianSplat.Define(stage, prim_path)
     else:
         prim = stage.DefinePrim(prim_path, _PARTICLE_FIELD_3D_GAUSSIAN_SPLAT)
-        if not prim:
-            raise RuntimeError(
-                f"Failed to create {_PARTICLE_FIELD_3D_GAUSSIAN_SPLAT} prim. "
-                "Ensure omni.usd.schema.usd_particle_field is loaded."
-            )
+        if not prim or not prim.IsValid():
+            raise RuntimeError(_PRIM_CREATE_FAILURE_MSG)
         gs_prim = prim
 
     stage.SetDefaultPrim(gs_prim.GetPrim() if hasattr(gs_prim, "GetPrim") else gs_prim)
@@ -509,8 +516,8 @@ def convertPlyUSD(
     """
     Convert PLY Gaussian Splat file to USD (Pixar reference implementation).
 
-    Uses ParticleField3DGaussianSplat schema via UsdVol when available
-    (OpenUSD 26.03+), or Omniverse usd_particle_field plugin when backported.
+    Uses the typed UsdVol.ParticleField3DGaussianSplat API when available
+    (OpenUSD 26.03+), or defines the prim type and attributes manually.
 
     Parameters
     ----------
@@ -572,11 +579,8 @@ def convertPlyUSD(
         gs_prim = UsdVol.ParticleField3DGaussianSplat.Define(stage, prim_path)
     else:
         prim = stage.DefinePrim(prim_path, _PARTICLE_FIELD_3D_GAUSSIAN_SPLAT)
-        if not prim:
-            raise RuntimeError(
-                f"Failed to create {_PARTICLE_FIELD_3D_GAUSSIAN_SPLAT} prim. "
-                "Ensure omni.usd.schema.usd_particle_field is loaded."
-            )
+        if not prim or not prim.IsValid():
+            raise RuntimeError(_PRIM_CREATE_FAILURE_MSG)
         gs_prim = prim
 
     stage.SetDefaultPrim(gs_prim.GetPrim() if hasattr(gs_prim, "GetPrim") else gs_prim)
