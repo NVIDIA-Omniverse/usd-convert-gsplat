@@ -91,9 +91,11 @@ def _set_prim_display_name_usd(prim, display_name: str) -> None:
 
 def _up_axis_token(up_axis: str):
     """Return the UsdGeom token for the given up-axis string."""
-    if up_axis and up_axis.upper() == UP_AXIS_Z:
+    if not up_axis or up_axis.upper() == UP_AXIS_Y:
+        return UsdGeom.Tokens.y
+    if up_axis.upper() == UP_AXIS_Z:
         return UsdGeom.Tokens.z
-    return UsdGeom.Tokens.y
+    raise ValueError(f"up_axis must be '{UP_AXIS_Y}' or '{UP_AXIS_Z}', got {up_axis!r}")
 
 
 def _euler_to_rotation(rx_deg: float, ry_deg: float, rz_deg: float):
