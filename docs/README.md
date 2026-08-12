@@ -25,7 +25,7 @@ Omniverse viewers, but schema validation is not performed at write time.
 The converter package lives in `source/python` and builds with standard Python
 packaging tools.
 
-Use Python 3.11 or 3.12. Python 3.10 is not compatible with the pinned `numpy==2.3.1` dependency.
+Use Python 3.11 or 3.12. Python 3.10 is excluded by the package's `requires-python = ">=3.11,<3.13"` constraint in `pyproject.toml`.
 
 ```bash
 cd source/python
