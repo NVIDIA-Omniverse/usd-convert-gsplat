@@ -530,6 +530,9 @@ def convertPlyUSD(
     input_file = resolve_local_path(input_file)
     output_file = resolve_local_path(output_file)
 
+    if len(rotation_degrees) != 3:
+        raise ValueError("rotation_degrees must be a sequence of three floats (rx, ry, rz)")
+
     prim_display_name = os.path.splitext(os.path.basename(input_file))[0]
     if prim_name is None:
         prim_name = os.path.splitext(os.path.basename(input_file))[0]
