@@ -147,7 +147,7 @@ Install and smoke test the local source tree:
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # Windows PowerShell: .\.venv\Scripts\Activate.ps1
-python -m pip install "./source/python[usd]"
+python -m pip install ".[usd]"
 python -m usd_convert_gsplat --help
 python -m usd_convert_gsplat -i input.ply -o output.usda
 ```
