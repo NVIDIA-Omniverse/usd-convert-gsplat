@@ -19,6 +19,7 @@ import os
 import re
 import zipfile
 
+import numpy as np
 from pxr import Gf, Sdf, Tf, Usd, UsdGeom, Vt
 
 from .local_paths import resolve_local_path
@@ -183,6 +184,28 @@ def _apply_euler_rotation(positions, rotations, rx_deg, ry_deg, rz_deg):
     return pos, rot
 
 
+def _quatf_array(rotations):
+    """
+    Build a Vt.QuatfArray from (N,4) quaternions stored as (w, x, y, z).
+
+    The arithmetic copies Gf.Quatf.Normalize() so the output is bit-identical:
+    float32 length, real part divided by it, imaginary part multiplied by its
+    double reciprocal, identity below 1e-10. Vt.QuatfArray stores (x, y, z, w).
+    """
+    rotations = np.asarray(rotations, dtype=np.float32)
+    w, x, y, z = rotations[:, 0], rotations[:, 1], rotations[:, 2], rotations[:, 3]
+    length = np.sqrt(x * x + y * y + z * z + w * w)
+    quats = np.empty((len(rotations), 4), dtype=np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv_length = 1.0 / length.astype(np.float64)
+        quats[:, 0] = x * inv_length
+        quats[:, 1] = y * inv_length
+        quats[:, 2] = z * inv_length
+        quats[:, 3] = w / length
+    quats[length < 1e-10] = (0.0, 0.0, 0.0, 1.0)
+    return Vt.QuatfArray.FromNumpy(quats)
+
+
 def _gaussian_splat_data_to_usd(
     splat_data,
     stage: Usd.Stage,
@@ -254,9 +277,7 @@ def _gaussian_splat_data_to_usd(
     if prim_display_name is not None:
         _set_prim_display_name_usd(prim0, prim_display_name)
 
-    positions_vt = Vt.Vec3fArray(
-        [Gf.Vec3f(float(positions[i, 0]), float(positions[i, 1]), float(positions[i, 2])) for i in range(vertex_count)]
-    )
+    positions_vt = Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(positions, dtype=np.float32))
     min_x = float(positions[:, 0].min())
     min_y = float(positions[:, 1].min())
     min_z = float(positions[:, 2].min())
@@ -274,24 +295,9 @@ def _gaussian_splat_data_to_usd(
         float(min(_EXTENT_LIMIT, max_z)),
     )
     extent = Vt.Vec3fArray([extent_min, extent_max])
-    scales_vt = Vt.Vec3fArray(
-        [
-            Gf.Vec3f(
-                math.exp(float(scales[i, 0])),
-                math.exp(float(scales[i, 1])),
-                math.exp(float(scales[i, 2])),
-            )
-            for i in range(vertex_count)
-        ]
-    )
-    orientations_list = []
-    for i in range(vertex_count):
-        w, x, y, z = float(rotations[i, 0]), float(rotations[i, 1]), float(rotations[i, 2]), float(rotations[i, 3])
-        quat = Gf.Quatf(w, x, y, z)
-        quat.Normalize()
-        orientations_list.append(quat)
-    orientations_vt = Vt.QuatfArray(orientations_list)
-    opacities_vt = Vt.FloatArray([1.0 / (1.0 + math.exp(-float(opacities[i]))) for i in range(vertex_count)])
+    scales_vt = Vt.Vec3fArray.FromNumpy(np.exp(scales.astype(np.float64)).astype(np.float32))
+    orientations_vt = _quatf_array(rotations)
+    opacities_vt = Vt.FloatArray.FromNumpy((1.0 / (1.0 + np.exp(-opacities.astype(np.float64)))).astype(np.float32))
 
     prim = gs_prim.GetPrim() if hasattr(gs_prim, "GetPrim") else gs_prim
 
@@ -341,35 +347,16 @@ def _gaussian_splat_data_to_usd(
         # PLY stores f_rest in channel-major order; USD expects vec3-major.
         # SPZ stores coefficient-major (vec3-major) per format spec.
         from_ply = not (source_file and source_file.lower().endswith(".spz"))
-        sh_data = []
-        for i in range(vertex_count):
-            vertex_sh = []
-            vertex_sh.append([float(f_dc[i, 0]), float(f_dc[i, 1]), float(f_dc[i, 2])])
-            for j in range(num_sh_vec3):
-                if from_ply:
-                    vertex_sh.append(
-                        [
-                            float(f_rest[i, j]),
-                            float(f_rest[i, num_sh_vec3 + j]),
-                            float(f_rest[i, 2 * num_sh_vec3 + j]),
-                        ]
-                    )
-                else:
-                    idx = j * 3
-                    vertex_sh.append(
-                        [
-                            float(f_rest[i, idx]),
-                            float(f_rest[i, idx + 1]),
-                            float(f_rest[i, idx + 2]),
-                        ]
-                    )
-            sh_data.extend(vertex_sh)
-        sh_vt = Vt.Vec3fArray([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in sh_data])
+        rest = f_rest[:, : 3 * num_sh_vec3]
+        if from_ply:
+            rest = rest.reshape(vertex_count, 3, num_sh_vec3).transpose(0, 2, 1)
+        else:
+            rest = rest.reshape(vertex_count, num_sh_vec3, 3)
+        sh = np.concatenate((f_dc[:, np.newaxis, :], rest), axis=1)
     else:
         sh_vec_stride = 1
-        sh_vt = Vt.Vec3fArray(
-            [Gf.Vec3f(float(f_dc[i, 0]), float(f_dc[i, 1]), float(f_dc[i, 2])) for i in range(vertex_count)]
-        )
+        sh = f_dc
+    sh_vt = Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(sh, dtype=np.float32).reshape(-1, 3))
 
     if _HasParticleField3DGaussianSplat:
         sh_attr = gs_prim.CreateRadianceSphericalHarmonicsCoefficientsAttr(sh_vt)
@@ -383,21 +370,13 @@ def _gaussian_splat_data_to_usd(
         sh_primvar.SetInterpolation(UsdGeom.Tokens.vertex)
 
     _SH_C0 = 0.28209479177387814
-    display_colors = []
-    for i in range(vertex_count):
-        r = 0.5 + _SH_C0 * float(f_dc[i, 0])
-        g = 0.5 + _SH_C0 * float(f_dc[i, 1])
-        b = 0.5 + _SH_C0 * float(f_dc[i, 2])
-        r = max(0.0, min(1.0, r))
-        g = max(0.0, min(1.0, g))
-        b = max(0.0, min(1.0, b))
-        display_colors.append(Gf.Vec3f(r, g, b))
+    display_colors = np.clip(0.5 + _SH_C0 * f_dc.astype(np.float64), 0.0, 1.0).astype(np.float32)
     primvars_api = UsdGeom.PrimvarsAPI(prim)
     display_color_primvar = primvars_api.CreatePrimvar(
         "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
     )
     if display_color_primvar:
-        display_color_primvar.Set(Vt.Vec3fArray(display_colors))
+        display_color_primvar.Set(Vt.Vec3fArray.FromNumpy(display_colors))
 
     stage.GetRootLayer().comment = (
         f"Converted from PLY/SPZ to USD using usd-convert-gsplat\n" f"Source file: {source_file}"
@@ -547,8 +526,6 @@ def convertPlyUSD(
     print(f"Vertex count: {vertex_count}")
     print(f"Available properties: {tuple(property_names)}")
 
-    import numpy as np
-
     if all(k in vertex_data for k in ("x", "y", "z")):
         _pos = np.stack([vertex_data["x"], vertex_data["y"], vertex_data["z"]], axis=1)
         _has_rot = all(k in vertex_data for k in ("rot_0", "rot_1", "rot_2", "rot_3"))
@@ -594,8 +571,8 @@ def convertPlyUSD(
 
     if all(prop in vertex_data for prop in ["x", "y", "z"]):
         print("\nProcessing positions...")
-        positions = list(zip(vertex_data["x"], vertex_data["y"], vertex_data["z"]))
-        positions_vt = Vt.Vec3fArray([Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in positions])
+        positions = np.stack([vertex_data["x"], vertex_data["y"], vertex_data["z"]], axis=1)
+        positions_vt = Vt.Vec3fArray.FromNumpy(positions.astype(np.float32))
         if _HasParticleField3DGaussianSplat:
             gs_prim.CreatePositionsAttr(positions_vt)
         else:
@@ -623,25 +600,21 @@ def convertPlyUSD(
 
     if all(prop in vertex_data for prop in ["scale_0", "scale_1", "scale_2"]):
         print("\nProcessing scales...")
-        scales = [
-            (math.exp(s0), math.exp(s1), math.exp(s2))
-            for s0, s1, s2 in zip(vertex_data["scale_0"], vertex_data["scale_1"], vertex_data["scale_2"])
-        ]
-        scales_vt = Vt.Vec3fArray([Gf.Vec3f(float(s[0]), float(s[1]), float(s[2])) for s in scales])
+        scales = np.stack([vertex_data["scale_0"], vertex_data["scale_1"], vertex_data["scale_2"]], axis=1)
+        scales_vt = Vt.Vec3fArray.FromNumpy(np.exp(scales.astype(np.float64)).astype(np.float32))
         if _HasParticleField3DGaussianSplat:
             gs_prim.CreateScalesAttr(scales_vt)
         else:
             _set_attr("scales", scales_vt, Sdf.ValueTypeNames.Float3Array)
         print(f"  Set scales for {vertex_count} vertices")
     elif generateScales:
-        import numpy as np
         from scipy.spatial import KDTree
 
         points = np.array(positions)
         tree = KDTree(points)
         distances, _ = tree.query(points, k=3, workers=-1)
         scales = (distances[:, 0] + distances[:, 1] + distances[:, 2]) / (3.0 * 2.0)
-        scales_vt = Vt.Vec3fArray([Gf.Vec3f(float(s), float(s), float(s)) for s in scales])
+        scales_vt = Vt.Vec3fArray.FromNumpy(np.repeat(scales[:, np.newaxis], 3, axis=1).astype(np.float32))
         if _HasParticleField3DGaussianSplat:
             gs_prim.CreateScalesAttr(scales_vt)
         else:
@@ -652,13 +625,9 @@ def convertPlyUSD(
 
     if all(prop in vertex_data for prop in ["rot_0", "rot_1", "rot_2", "rot_3"]):
         print("\nProcessing orientations...")
-        orientations = list(zip(vertex_data["rot_1"], vertex_data["rot_2"], vertex_data["rot_3"], vertex_data["rot_0"]))
-        orientations_list = []
-        for q in orientations:
-            quat = Gf.Quatf(float(q[3]), float(q[0]), float(q[1]), float(q[2]))
-            quat.Normalize()
-            orientations_list.append(quat)
-        orientations_vt = Vt.QuatfArray(orientations_list)
+        orientations_vt = _quatf_array(
+            np.stack([vertex_data["rot_0"], vertex_data["rot_1"], vertex_data["rot_2"], vertex_data["rot_3"]], axis=1)
+        )
         if _HasParticleField3DGaussianSplat:
             gs_prim.CreateOrientationsAttr(orientations_vt)
         else:
@@ -669,8 +638,8 @@ def convertPlyUSD(
 
     if "opacity" in vertex_data:
         print("\nProcessing opacities...")
-        opacities = [1.0 / (1.0 + math.exp(-v)) for v in vertex_data["opacity"]]
-        opacities_vt = Vt.FloatArray(opacities)
+        opacities = 1.0 / (1.0 + np.exp(-vertex_data["opacity"].astype(np.float64)))
+        opacities_vt = Vt.FloatArray.FromNumpy(opacities.astype(np.float32))
         if _HasParticleField3DGaussianSplat:
             gs_prim.CreateOpacitiesAttr(opacities_vt)
         else:
@@ -681,7 +650,7 @@ def convertPlyUSD(
 
     if all(prop in vertex_data for prop in ["f_dc_0", "f_dc_1", "f_dc_2"]):
         print("\nProcessing spherical harmonics...")
-        f_dc = list(zip(vertex_data["f_dc_0"], vertex_data["f_dc_1"], vertex_data["f_dc_2"]))
+        f_dc = np.stack([vertex_data["f_dc_0"], vertex_data["f_dc_1"], vertex_data["f_dc_2"]], axis=1)
 
         max_sh_index = -1
         for i in range(45):
@@ -711,22 +680,13 @@ def convertPlyUSD(
 
         if max_sh_index >= 0:
             stride = max_sh_index + 1
-            f_rest_data = [vertex_data[f"f_rest_{i}"] for i in range(stride)]
-            f_rest = list(zip(*f_rest_data))
+            f_rest = np.stack([vertex_data[f"f_rest_{i}"] for i in range(stride)], axis=1)
             num_sh_vec3 = stride // 3
             sh_vec_stride = num_sh_vec3 + 1
 
-            sh_data = []
-            for i in range(vertex_count):
-                vertex_sh = [[0.0, 0.0, 0.0] for _ in range(sh_vec_stride)]
-                vertex_sh[0] = list(f_dc[i])
-                for j in range(num_sh_vec3):
-                    for k in range(3):
-                        src_index = k * num_sh_vec3 + j
-                        vertex_sh[j + 1][k] = f_rest[i][src_index]
-                sh_data.extend(vertex_sh)
-
-            sh_vt = Vt.Vec3fArray([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in sh_data])
+            rest = f_rest[:, : 3 * num_sh_vec3].reshape(vertex_count, 3, num_sh_vec3).transpose(0, 2, 1)
+            sh = np.concatenate((f_dc[:, np.newaxis, :], rest), axis=1)
+            sh_vt = Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(sh, dtype=np.float32).reshape(-1, 3))
             if _HasParticleField3DGaussianSplat:
                 sh_attr = gs_prim.CreateRadianceSphericalHarmonicsCoefficientsAttr(sh_vt)
             else:
@@ -745,7 +705,7 @@ def convertPlyUSD(
                 gs_prim.CreateRadianceSphericalHarmonicsDegreeAttr(0)
             else:
                 _set_attr("radiance:sphericalHarmonicsDegree", 0, Sdf.ValueTypeNames.Int)
-            sh_vt = Vt.Vec3fArray([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in f_dc])
+            sh_vt = Vt.Vec3fArray.FromNumpy(f_dc.astype(np.float32))
             if _HasParticleField3DGaussianSplat:
                 sh_attr = gs_prim.CreateRadianceSphericalHarmonicsCoefficientsAttr(sh_vt)
             else:
@@ -763,16 +723,8 @@ def convertPlyUSD(
     elif all(prop in vertex_data for prop in ["red", "green", "blue"]):
         if generateSh:
             _SH_C0 = 0.28209479177387814
-            sh_dc = Vt.Vec3fArray(
-                [
-                    Gf.Vec3f(
-                        (float(v[0]) / 255.0 - 0.5) / _SH_C0,
-                        (float(v[1]) / 255.0 - 0.5) / _SH_C0,
-                        (float(v[2]) / 255.0 - 0.5) / _SH_C0,
-                    )
-                    for v in zip(vertex_data["red"], vertex_data["green"], vertex_data["blue"])
-                ]
-            )
+            rgb = np.stack([vertex_data["red"], vertex_data["green"], vertex_data["blue"]], axis=1)
+            sh_dc = Vt.Vec3fArray.FromNumpy(((rgb.astype(np.float64) / 255.0 - 0.5) / _SH_C0).astype(np.float32))
             if _HasParticleField3DGaussianSplat:
                 gs_prim.CreateRadianceSphericalHarmonicsDegreeAttr(0)
                 sh_attr = gs_prim.CreateRadianceSphericalHarmonicsCoefficientsAttr(sh_dc)
@@ -797,16 +749,12 @@ def convertPlyUSD(
 
     if all(prop in vertex_data for prop in ["f_dc_0", "f_dc_1", "f_dc_2"]):
         _SH_C0 = 0.28209479177387814
-        display_colors = []
-        for v in zip(vertex_data["f_dc_0"], vertex_data["f_dc_1"], vertex_data["f_dc_2"]):
-            r = max(0.0, min(1.0, 0.5 + _SH_C0 * float(v[0])))
-            g = max(0.0, min(1.0, 0.5 + _SH_C0 * float(v[1])))
-            b = max(0.0, min(1.0, 0.5 + _SH_C0 * float(v[2])))
-            display_colors.append(Gf.Vec3f(r, g, b))
+        f_dc = np.stack([vertex_data["f_dc_0"], vertex_data["f_dc_1"], vertex_data["f_dc_2"]], axis=1)
+        display_colors = np.clip(0.5 + _SH_C0 * f_dc.astype(np.float64), 0.0, 1.0).astype(np.float32)
         primvars_api = UsdGeom.PrimvarsAPI(prim)
         pv = primvars_api.CreatePrimvar("displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex)
         if pv:
-            pv.Set(Vt.Vec3fArray(display_colors))
+            pv.Set(Vt.Vec3fArray.FromNumpy(display_colors))
 
     stage.Save()
 
