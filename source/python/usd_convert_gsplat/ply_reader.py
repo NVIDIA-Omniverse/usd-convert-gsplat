@@ -19,12 +19,40 @@ import numpy as np
 
 from .local_paths import resolve_local_path
 
-__all__ = ["GaussianSplatData", "read_ply", "read_ply_raw"]
+__all__ = [
+    "GaussianSplatMetadata",
+    "GaussianSplatData",
+    "read_ply_metadata",
+    "read_ply",
+    "read_ply_raw",
+    "SH_LAYOUT_CHANNEL_MAJOR",
+    "SH_LAYOUT_VEC3_MAJOR",
+]
+
+# Memory layout of the higher-order SH coefficients in ``f_rest``.
+#
+# PLY stores them channel-major: all R coefficients, then all G, then all B, so
+# coefficient j of channel k is at ``f_rest[i, k * M + j]``.
+# SPZ stores them vec3-major (coefficient-major) per its format spec, i.e.
+# already ``(coefficient, channel)`` and needing no transpose.
+#
+# The layout travels with the data so the writer never has to infer it from a
+# file path.
+SH_LAYOUT_CHANNEL_MAJOR = "channel_major"
+SH_LAYOUT_VEC3_MAJOR = "vec3_major"
+
+
+@dataclass(frozen=True)
+class GaussianSplatMetadata:
+    """Bulk-array metadata available without loading splat values."""
+
+    count: int
+    sh_coefficient_count: int
 
 
 @dataclass
 class GaussianSplatData:
-    """Parsed Gaussian Splat data from a PLY file."""
+    """Parsed Gaussian Splat data from a PLY or SPZ file."""
 
     positions: np.ndarray  # (N, 3) float32 - xyz center positions
     scales: np.ndarray  # (N, 3) float32 - log-scale per axis
@@ -32,6 +60,7 @@ class GaussianSplatData:
     opacities: np.ndarray  # (N,)   float32 - raw opacity (pre-sigmoid)
     f_dc: np.ndarray  # (N, 3) float32 - DC spherical harmonic (base RGB)
     f_rest: Optional[np.ndarray] = None  # (N, K) float32 - higher-order SH coeffs
+    sh_layout: str = SH_LAYOUT_CHANNEL_MAJOR  # layout of f_rest; see constants above
     count: int = 0
 
     def __post_init__(self):
@@ -135,6 +164,25 @@ def _parse_header(f) -> Tuple[int, List[Tuple[str, str]], str]:
     return num_vertices, properties, fmt
 
 
+def read_ply_metadata(filepath: str) -> GaussianSplatMetadata:
+    """Read the splat count and SH layout from a PLY header only."""
+    filepath = resolve_local_path(filepath)
+    with open(filepath, "rb") as f:
+        num_vertices, properties, _ = _parse_header(f)
+    if num_vertices <= 0:
+        raise ValueError(f"PLY file has an invalid vertex count: {num_vertices}")
+
+    rest_coefficient_count = sum(name.startswith("f_rest_") for name, _ in properties)
+    if rest_coefficient_count % 3 != 0:
+        raise ValueError(
+            f"PLY file has {rest_coefficient_count} higher-order SH properties; " "the count must be divisible by 3"
+        )
+    return GaussianSplatMetadata(
+        count=num_vertices,
+        sh_coefficient_count=1 + rest_coefficient_count // 3,
+    )
+
+
 def _read_binary(
     f,
     num_vertices: int,
@@ -204,8 +252,8 @@ def read_ply_raw(filepath: str) -> Tuple[Dict[str, np.ndarray], int, List[str]]:
     filepath = resolve_local_path(filepath)
     with open(filepath, "rb") as f:
         num_vertices, properties, fmt = _parse_header(f)
-        if num_vertices == 0:
-            raise ValueError("PLY file contains no vertices")
+        if num_vertices <= 0:
+            raise ValueError(f"PLY file has an invalid vertex count: {num_vertices}")
         if fmt == "ascii":
             data = _read_ascii(f, num_vertices, properties)
         elif fmt == "binary_little_endian":
@@ -218,7 +266,27 @@ def read_ply_raw(filepath: str) -> Tuple[Dict[str, np.ndarray], int, List[str]]:
     return data, num_vertices, prop_names
 
 
-def read_ply(filepath: str) -> GaussianSplatData:
+def _estimate_log_scales(positions: np.ndarray) -> np.ndarray:
+    """
+    Estimate isotropic log-scales from local neighbourhood spacing.
+
+    Uses the mean distance to the three nearest neighbours, halved. Because
+    ``GaussianSplatData.scales`` is log-scale and the writer exponentiates, the
+    estimate is returned in log space.
+
+    Requires SciPy; the import is local so SciPy stays an optional dependency.
+    """
+    from scipy.spatial import KDTree
+
+    tree = KDTree(positions)
+    distances, _ = tree.query(positions, k=3, workers=-1)
+    spacing = (distances[:, 0] + distances[:, 1] + distances[:, 2]) / (3.0 * 2.0)
+    # Coincident points give a spacing of 0, and log(0) is -inf. Floor it.
+    log_scale = np.log(np.maximum(spacing, 1e-8)).astype(np.float32)
+    return np.repeat(log_scale[:, None], 3, axis=1)
+
+
+def read_ply(filepath: str, generate_scales: bool = False) -> GaussianSplatData:
     """
     Read a 3D Gaussian Splat PLY file (standard 3DGS format).
 
@@ -229,6 +297,20 @@ def read_ply(filepath: str) -> GaussianSplatData:
         opacity                     - pre-sigmoid opacity
         f_dc_0, f_dc_1, f_dc_2     - DC spherical harmonic coefficients
         f_rest_0 .. f_rest_N        - higher-order SH coefficients (optional)
+
+    Missing data is completed here rather than at write time, so that every
+    consumer of GaussianSplatData sees a fully populated record:
+
+    - ``f_dc_*`` absent but ``red``/``green``/``blue`` present: DC coefficients
+      are derived from the vertex colours.
+    - ``scale_*`` absent and ``generate_scales`` set: scales are estimated from
+      local neighbourhood spacing (requires SciPy).
+
+    Parameters
+    ----------
+    filepath : path to the .ply file
+    generate_scales : estimate scales when the file has no ``scale_*``
+                      properties, instead of defaulting them to zero
     """
     filepath = resolve_local_path(filepath)
     print(f"[3DGS] Reading PLY file: {filepath}")
@@ -241,8 +323,14 @@ def read_ply(filepath: str) -> GaussianSplatData:
 
     if all(k in data for k in ("scale_0", "scale_1", "scale_2")):
         scales = np.stack([data["scale_0"], data["scale_1"], data["scale_2"]], axis=1)
+    elif generate_scales:
+        scales = _estimate_log_scales(positions)
+        print(f"[3DGS] Generated scales for {num_vertices:,} splats from local neighborhood spacing")
     else:
-        print("[3DGS] Warning: scale_0/1/2 not found, defaulting to zero")
+        print(
+            "[3DGS] Warning: scale_0/1/2 not found, defaulting to zero. "
+            "Re-run with --generateScales to estimate them."
+        )
         scales = np.zeros((num_vertices, 3), dtype=np.float32)
 
     if all(k in data for k in ("rot_0", "rot_1", "rot_2", "rot_3")):
@@ -290,4 +378,5 @@ def read_ply(filepath: str) -> GaussianSplatData:
         opacities=opacities.astype(np.float32),
         f_dc=f_dc.astype(np.float32),
         f_rest=f_rest,
+        sh_layout=SH_LAYOUT_CHANNEL_MAJOR,
     )

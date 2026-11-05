@@ -37,12 +37,16 @@ from typing import Optional
 import numpy as np
 
 from .local_paths import resolve_local_path
-from .ply_reader import GaussianSplatData
+from .ply_reader import SH_LAYOUT_VEC3_MAJOR, GaussianSplatData, GaussianSplatMetadata
 
 _SPZ_MAGIC = 0x5053474E  # "NGSP" as little-endian uint32
 _SUPPORTED_VERSIONS = (2, 3)
 
 _COLOR_SCALE = 0.15
+
+# Hard cap on decompressed .spz stream size, to bound the allocation from an
+# untrusted gzip input and reject decompression bombs (CWE-409 / CWE-400).
+_MAX_DECOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 
 def _num_rest_coeffs(sh_degree: int) -> int:
@@ -50,6 +54,35 @@ def _num_rest_coeffs(sh_degree: int) -> int:
     if sh_degree == 0:
         return 0
     return 3 * ((sh_degree + 1) ** 2 - 1)
+
+
+def _parse_spz_header(header: bytes) -> tuple[int, int, int, int, int]:
+    if len(header) < 16:
+        raise ValueError("SPZ file too small to contain a valid header")
+
+    magic, version, num_points, sh_degree, fractional_bits, flags, _ = struct.unpack_from("<IIIBBBB", header, 0)
+    if magic != _SPZ_MAGIC:
+        raise ValueError(f"Not an SPZ file (magic 0x{magic:08X}, expected 0x{_SPZ_MAGIC:08X})")
+    if version not in _SUPPORTED_VERSIONS:
+        raise ValueError(f"Unsupported SPZ version: {version}")
+    if sh_degree > 3:
+        raise ValueError(f"Invalid SH degree: {sh_degree}")
+    if num_points <= 0:
+        raise ValueError(f"SPZ file contains no splats (numPoints={num_points})")
+
+    return version, num_points, sh_degree, fractional_bits, flags
+
+
+def read_spz_metadata(filepath: str) -> GaussianSplatMetadata:
+    """Read the splat count and SH degree from the compressed SPZ header only."""
+    filepath = resolve_local_path(filepath)
+    with gzip.open(filepath, "rb") as f:
+        header = f.read(16)
+    _, num_points, sh_degree, _, _ = _parse_spz_header(header)
+    return GaussianSplatMetadata(
+        count=num_points,
+        sh_coefficient_count=(sh_degree + 1) ** 2,
+    )
 
 
 def _read_int24_block(raw: bytes, count: int) -> np.ndarray:
@@ -109,6 +142,9 @@ def _decode_rotations_v3(raw: bytes, N: int) -> np.ndarray:
     C_MASK = (1 << 9) - 1
     SCALE = 0.7071067811865476  # 1/sqrt(2)
 
+    if len(raw) < N * 4:
+        raise ValueError(f"Truncated SPZ v3 rotation data: need {N * 4} bytes for {N:,} splats, got {len(raw)}")
+
     rotations = np.zeros((N, 4), dtype=np.float32)
     for i in range(N):
         packed = struct.unpack_from("<I", raw, i * 4)[0]
@@ -164,22 +200,20 @@ def read_spz(filepath: str) -> GaussianSplatData:
     print(f"[3DGS] Reading SPZ file: {filepath}")
 
     with gzip.open(filepath, "rb") as f:
-        data = f.read()
+        # Bounded read: never materialize an unbounded decompressed stream.
+        # gzip reaches ~1000:1 on zero-filled input, so a tiny .spz could expand
+        # to GBs and OOM the process. Reading at most the cap (+1 to detect
+        # overflow) turns a decompression-bomb DoS into a handled ValueError.
+        data = f.read(_MAX_DECOMPRESSED_BYTES + 1)
 
-    if len(data) < 16:
-        raise ValueError("SPZ file too small to contain a valid header")
+    if len(data) > _MAX_DECOMPRESSED_BYTES:
+        raise ValueError(
+            f"SPZ decompressed stream exceeds the {_MAX_DECOMPRESSED_BYTES:,}-byte "
+            "limit (possible decompression bomb)"
+        )
 
-    magic, version, num_points, sh_degree, fractional_bits, flags, _ = struct.unpack_from("<IIIBBBB", data, 0)
+    version, N, sh_degree, fractional_bits, flags = _parse_spz_header(data)
 
-    if magic != _SPZ_MAGIC:
-        raise ValueError(f"Not an SPZ file (magic 0x{magic:08X}, expected 0x{_SPZ_MAGIC:08X})")
-    if version not in _SUPPORTED_VERSIONS:
-        raise ValueError(f"Unsupported SPZ version: {version}")
-
-    if sh_degree > 3:
-        raise ValueError(f"Invalid SH degree: {sh_degree}")
-
-    N = num_points
     num_rest = _num_rest_coeffs(sh_degree)
 
     print(
@@ -197,7 +231,19 @@ def read_spz(filepath: str) -> GaussianSplatData:
     rot_size = N * rot_bytes_per_splat
     rest_size = N * num_rest
 
-    total_needed = offset + pos_size + alpha_size + color_size + scale_size + rot_size + rest_size
+    # Required per-splat fields must be fully present. A truncated file here
+    # would otherwise produce a mis-shaped buffer and leak a low-level error
+    # (e.g. struct.error / ValueError from reshape) instead of the reader's
+    # documented, catchable ValueError contract. Rest SH is optional and may
+    # legitimately be absent, so only warn on that tail being short.
+    required_needed = offset + pos_size + alpha_size + color_size + scale_size + rot_size
+    if len(data) < required_needed:
+        raise ValueError(
+            f"Truncated SPZ file: need at least {required_needed} bytes for "
+            f"{N:,} splats (v{version}), got {len(data)}"
+        )
+
+    total_needed = required_needed + rest_size
     if len(data) < total_needed:
         print(
             f"[3DGS] Warning: file smaller than expected "
@@ -234,4 +280,5 @@ def read_spz(filepath: str) -> GaussianSplatData:
         opacities=opacities,
         f_dc=f_dc,
         f_rest=f_rest,
+        sh_layout=SH_LAYOUT_VEC3_MAJOR,
     )
