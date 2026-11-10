@@ -231,9 +231,11 @@ def _is_channel_major(sh_layout: str) -> bool:
 
 def _up_axis_token(up_axis: str):
     """Return the UsdGeom token for the given up-axis string."""
-    if up_axis and up_axis.upper() == UP_AXIS_Z:
+    if not up_axis or up_axis.upper() == UP_AXIS_Y:
+        return UsdGeom.Tokens.y
+    if up_axis.upper() == UP_AXIS_Z:
         return UsdGeom.Tokens.z
-    return UsdGeom.Tokens.y
+    raise ValueError(f"up_axis must be '{UP_AXIS_Y}' or '{UP_AXIS_Z}', got {up_axis!r}")
 
 
 def _variant(base: str, half: bool, float_type, half_type):
