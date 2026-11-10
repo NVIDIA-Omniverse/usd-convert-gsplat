@@ -707,6 +707,7 @@ def write_gaussian_splat_usd(
     base, ext = os.path.splitext(output_path)
     if not ext or ext.lower() not in (".usd", ".usda", ".usdc", ".usdz"):
         ext = ".usda"
+    output_path = base + ext  # return the path that will actually be written
 
     want_usdz = ext.lower() == ".usdz"
     if want_usdz:
