@@ -1,5 +1,9 @@
 # 3D Gaussian Splat Converter
 
+## Start here
+
+For installation, supported formats, platform requirements, and CLI/Python examples, see the [package user guide](source/python/README.md). The developer guide below covers working from source.
+
 ## Developer Guide
 
 ### Project Structure
